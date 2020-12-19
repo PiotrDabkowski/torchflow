@@ -87,6 +87,8 @@ def get_no_sep_modules():
         FlowActnorm(CHANNELS),
         FlowConv1x1(CHANNELS),
         FlowInverse(FlowConv1x1(CHANNELS)),
+        FlowConv1x1LU(CHANNELS),
+        FlowInverse(FlowConv1x1Fixed(CHANNELS)),
         FlowSequentialModule(
             FlowActnorm(channels=CHANNELS),
             FlowConv1x1(channels=CHANNELS)),

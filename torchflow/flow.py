@@ -6,6 +6,12 @@ import copy
 
 FlowData = TypeVar("FlowData", torch.Tensor, List[torch.Tensor], Any)
 
+def level_encode(data: torch.Tensor, num_levels=32, input_range=(0.0, 1.0), eps=1e-6):
+    scale = input_range[1] - input_range[0]
+    scaled = (data - input_range[0]) / scale
+    leveled = (scaled * (1.0 - eps) * num_levels).floor() + torch.empty_like(data).uniform_()
+    return leveled / num_levels * scale + input_range[0]
+
 class Flow:
     def __init__(self, data: FlowData, device=None):
         self.data: FlowData = data
@@ -21,17 +27,18 @@ class Flow:
     def get_logp(self):
         return self.logpz + self.logdet
 
-    def get_pix_bits(self, imgs, levels):
+    def get_data_bits(self, input_data_shape, num_data_levels):
         p = self.get_logp().mean()
-        num_pix = np.prod(imgs.shape[1:])
-        p_pix = p / num_pix + np.log(1. / levels)
-        return -p_pix
+        num_pix = np.prod(input_data_shape[1:])
+        p_pix = p / num_pix + np.log(1. / num_data_levels)
+        return -p_pix / np.log(2.)
 
     def deep_copy(self):
         flow: Flow = copy.copy(self)
         flow.logpz = flow.logpz.detach().clone()
         flow.logdet = flow.logdet.detach().clone()
         flow.data = self._copy_data(flow.data)
+        flow.zs = [self._copy_data(e) for e in flow.zs]
         return flow
 
     @classmethod
@@ -53,6 +60,8 @@ class Flow:
 
 
 class FlowModule(torch.nn.Module):
+    CHECK_FLOW_EXPLOSION = True
+
     def forward(self, flow: Flow) -> Flow:
         return self.encode(flow)
 
@@ -103,8 +112,75 @@ class FlowSqueeze2D(FlowModule):
     def decode_(self, x):
         return F.pixel_shuffle(x, 2), 0.
 
+class _FlowConv1x1(FlowModule):
+    def __init__(self):
+        super().__init__()
 
-class FlowConv1x1(FlowModule):
+    def _get_inverse_2d_weight(self):
+        # This is fast enough - only needed for decoding. In the final model this can be changed to a constant,
+        # maybe jit.trace does it already?
+        return torch.inverse(self._get_2d_weight())
+
+    def _get_2d_weight(self):
+        raise NotImplementedError()
+
+    def _get_forward_logdet(self):
+        return torch.slogdet(self._get_2d_weight()).logabsdet
+
+    def __get_forward_logdet(self, x):
+        # Multiply by the number of elements on which the 1x1 conv is performed.
+        return self._get_forward_logdet() * np.prod(x.shape[2:])
+
+    def encode_(self, x):
+        dims = len(x.shape)
+        if dims == 4:
+            return F.conv2d(x, weight=self._get_2d_weight().unsqueeze(2).unsqueeze(2)), self.__get_forward_logdet(x)
+        elif dims == 3:
+            return F.conv1d(x, weight=self._get_2d_weight().unsqueeze(2)), self.__get_forward_logdet(x)
+        else:
+            raise ValueError()
+
+    def decode_(self, x):
+        dims = len(x.shape)
+        if dims == 4:
+            return F.conv2d(x, weight=self._get_inverse_2d_weight().unsqueeze(2).unsqueeze(2)), -self.__get_forward_logdet(x)
+        elif dims == 3:
+            return F.conv1d(x, weight=self._get_inverse_2d_weight().unsqueeze(2)), -self.__get_forward_logdet(x)
+        else:
+            raise ValueError()
+
+
+class FlowConv1x1(_FlowConv1x1):
+    def __init__(self, channels):
+        super().__init__()
+        permutation = torch.Tensor(channels, channels)
+        torch.nn.init.orthogonal_(permutation, gain=1)
+        self.weight = torch.nn.Parameter(permutation)
+
+    def _get_2d_weight(self):
+        return self.weight
+
+
+class FlowConv1x1Fixed(_FlowConv1x1):
+    def __init__(self, channels):
+        super().__init__()
+        permutation = torch.Tensor(channels, channels)
+        torch.nn.init.orthogonal_(permutation, gain=1)
+        self.register_buffer('fixed_permutation_logdet', torch.slogdet(permutation).logabsdet)
+        self.register_buffer('fixed_permutation_inverse', torch.inverse(permutation))
+        self.register_buffer('fixed_permutation', permutation)
+
+    def _get_2d_weight(self):
+        return self._buffers['fixed_permutation']
+
+    def _get_forward_logdet(self):
+        return self._buffers['fixed_permutation_logdet']
+
+    def _get_inverse_2d_weight(self):
+        return self._buffers['fixed_permutation_inverse']
+
+
+class FlowConv1x1LU(_FlowConv1x1):
     """https://arxiv.org/pdf/1807.03039.pdf"""
 
     def __init__(self, channels):
@@ -120,42 +196,16 @@ class FlowConv1x1(FlowModule):
         # Permutation must have abs(determinant) equal to 1.
         assert torch.slogdet(self._buffers['fixed_permutation']).logabsdet == 0.0
 
-    def _get_inverse_2d_weight(self):
-        # This is fast enough - only needed for decoding. In the final model this can be changed to a constant,
-        # maybe jit.trace does it already?
-        return torch.inverse(self._get_2d_weight())
-
     def _get_2d_weight(self):
         return torch.matmul(torch.matmul(self._buffers['fixed_permutation'], torch.tril(self.lower)),
                             torch.triu(self.upper))
 
-    def _get_forward_logdet(self, x):
+    def _get_forward_logdet(self):
         element_logdet = torch.sum(torch.log(torch.abs(torch.diag(self.lower))))
         element_logdet += torch.sum(torch.log(torch.abs(torch.diag(self.upper))))
-        # Multiply by the number of elements on which the 1x1 conv is performed.
-        for dim_size in x.shape[2:]:
-            element_logdet *= dim_size
         return element_logdet
 
-    def encode_(self, x):
-        dims = len(x.shape)
-        if dims == 4:
-            return F.conv2d(x, weight=self._get_2d_weight().unsqueeze(2).unsqueeze(2)), self._get_forward_logdet(x)
-        elif dims == 3:
-            return F.conv1d(x, weight=self._get_2d_weight().unsqueeze(2)), self._get_forward_logdet(x)
-        else:
-            raise ValueError()
 
-    def decode_(self, x):
-        dims = len(x.shape)
-        if dims == 4:
-            return F.conv2d(x,
-                            weight=self._get_inverse_2d_weight().unsqueeze(2).unsqueeze(2)), -self._get_forward_logdet(
-                x)
-        elif dims == 3:
-            return F.conv1d(x, weight=self._get_inverse_2d_weight().unsqueeze(2)), -self._get_forward_logdet(x)
-        else:
-            raise ValueError()
 
 
 def mean_for(x, dim):
@@ -211,15 +261,78 @@ class FlowActnorm(FlowModule):
             self._do_init(x)
         dims = len(x.shape)
         means = adapt_for(self.means, dim=1, dims=dims)
-        log_stds = adapt_for(self.log_stds, dim=1, dims=dims)
+        log_stds = soft_abs_limit(adapt_for(self.log_stds, dim=1, dims=dims), limit=3.0)
         return (x - means) * torch.exp(-log_stds), self._get_forward_logdet(x)
 
     def decode_(self, x):
         dims = len(x.shape)
         means = adapt_for(self.means, dim=1, dims=dims)
-        log_stds = adapt_for(self.log_stds, dim=1, dims=dims)
+        log_stds = soft_abs_limit(adapt_for(self.log_stds, dim=1, dims=dims), limit=3.0)
         x = x * torch.exp(log_stds) + means
         return x, -self._get_forward_logdet(x)
+
+class FlowActivenorm(FlowModule):
+
+    def __init__(self, channels, momentum=0.8):
+        super().__init__()
+        shape = [channels]
+        self.desired_log_scales = torch.nn.Parameter(torch.Tensor(*shape).zero_())
+        self.desired_mean = torch.nn.Parameter(torch.Tensor(*shape).zero_())
+        self.register_buffer('means', torch.Tensor(*shape).zero_())
+        self.register_buffer('vars', torch.Tensor(*shape).zero_() + 1.)
+        self.register_buffer('num_stat_updates', torch.tensor(0))
+        self.momentum = momentum
+
+    def _get_actual_log_scales(self):
+        return soft_abs_limit(self.desired_log_scales, limit=5.) - 0.5*torch.log(self._buffers['vars'])
+
+    def _get_actual_mean(self):
+        # (-mean*actual_std + desired_mean)
+        return self.desired_mean
+
+    def _update_stats(self, x):
+        return
+        means = mean_for(x, dim=1).detach()
+        vars = mean_for(x * x, dim=1).detach() - means ** 2 + 1e-6
+
+        old_weight = 0. # (1. - torch.pow(torch.tensor(self.momentum, device=x.device), self._buffers['num_stat_updates'])) * self.momentum
+        new_weight = 1 - self.momentum
+        means = (means * new_weight + self._buffers['means'] * old_weight) / (new_weight + old_weight)
+        vars = (vars * new_weight + self._buffers['vars'] * old_weight) / (new_weight + old_weight)
+
+        with torch.no_grad():
+            self._buffers['means'].copy_(means)
+            self._buffers['vars'].copy_(vars)
+            self._buffers['num_stat_updates'].copy_(self._buffers['num_stat_updates'] + 1)
+
+    def _get_forward_logdet(self, x):
+        logdet = torch.sum(self._get_actual_log_scales())
+        for dim_size in x.shape[2:]:
+            logdet *= dim_size
+        return -logdet
+
+    def encode_(self, x):
+        if self.training:
+            self._update_stats(x)
+
+        # (x - mean) / std * desired_std + desired_mean =
+        # = x * actual_scale + (-mean*actual_scale + desired_mean) =
+        # = x * actual_scale + actual_mean
+        # Where actual_std = desired_std / std
+        dims = len(x.shape)
+        means = adapt_for(self._get_actual_mean(), dim=1, dims=dims)
+        scales = adapt_for(torch.exp(self._get_actual_log_scales()), dim=1, dims=dims)
+        return x * scales - means, self._get_forward_logdet(x)
+
+    def decode_(self, x):
+        dims = len(x.shape)
+        means = adapt_for(self._get_actual_mean(), dim=1, dims=dims)
+        inv_scales = adapt_for(torch.exp(-self._get_actual_log_scales()), dim=1, dims=dims)
+        return (x + means) * inv_scales, -self._get_forward_logdet(x)
+
+
+def soft_abs_limit(x, limit=5.):
+    return limit * torch.tanh(x / limit)
 
 
 class FlowAffineCoupling(FlowModule):
@@ -234,6 +347,7 @@ class FlowAffineCoupling(FlowModule):
     def _get_biases_logscales(self, left, right):
         biases_logscales = self.nonlinear_module(left)
         biases, logscales = torch.chunk(biases_logscales, 2, dim=self.channel_dim)
+        logscales = soft_abs_limit(logscales, limit=1.1)
         assert biases.shape == right.shape, (left.shape, biases.shape, right.shape)
         assert logscales.shape == right.shape
         return biases, logscales
@@ -247,8 +361,7 @@ class FlowAffineCoupling(FlowModule):
     def decode_(self, x):
         left, right = torch.chunk(x, 2, dim=self.channel_dim)
         biases, logscales = self._get_biases_logscales(left, right)
-        return torch.cat([left, torch.exp(-logscales) * (right - biases)], dim=self.channel_dim), -sum_for(logscales,
-                                                                                                           dim=0)
+        return torch.cat([left, torch.exp(-logscales) * (right - biases)], dim=self.channel_dim), -sum_for(logscales, dim=0)
 
 
 class FlowAdditiveCoupling(FlowModule):
@@ -280,6 +393,13 @@ class FlowSequentialModule(FlowModule):
     def encode(self, flow: Flow):
         for module in self._modules.values():
             flow = module.encode(flow)
+            if self.CHECK_FLOW_EXPLOSION:
+                logdet = flow.logdet.mean().cpu().item()
+                logpz = flow.logpz.mean().cpu().item()
+                if abs(logdet) >1e10:
+                    raise ValueError("Logdet exploded %f, module %s" % (logdet, module))
+                if abs(logpz) >1e10:
+                    raise ValueError("Logpz exploded %f, module %s" % (logpz, module))
         return flow
 
     def decode(self, flow: Flow):
@@ -450,7 +570,7 @@ class FlowGlowStep(FlowSequentialModule):
     """
 
     def __init__(self, channels, conv_hidden_dim=None, use_affine_coupling=True):
-        conv_hidden_dim = conv_hidden_dim if conv_hidden_dim is not None else min(channels * 6, 512)
+        conv_hidden_dim = conv_hidden_dim if conv_hidden_dim is not None else min(channels * 12, 512)
         nonlinear_module = torch.nn.Sequential(
             torch.nn.Conv2d(channels // 2, out_channels=conv_hidden_dim, kernel_size=3, padding=1),
             torch.nn.ReLU(),
@@ -463,7 +583,7 @@ class FlowGlowStep(FlowSequentialModule):
         coupling_module = FlowAffineCoupling if use_affine_coupling else FlowAdditiveCoupling
         super().__init__(
             FlowActnorm(channels=channels),
-            FlowConv1x1(channels=channels),
+            FlowConv1x1LU(channels=channels),
             coupling_module(nonlinear_module=nonlinear_module)
         )
 
@@ -477,7 +597,7 @@ class FlowGlowNetwork(FlowSequentialModule):
         for glow_step_repeat in glow_step_repeats:
             modules.append(FlowSqueeze2D())
             channels *= 4
-            modules.append(FlowSequentialModule(*[FlowGlowStep(channels) for _ in range(glow_step_repeat)]))
+            modules.append(FlowSequentialModule(*[FlowGlowStep(channels, use_affine_coupling=False) for _ in range(glow_step_repeat)]))
             modules.append(FlowSplitGaussianPrior(split_fraction=0.5, split_dim=1))
             channels //= 2
         modules[-1] = FlowTerminateGaussianPrior()
