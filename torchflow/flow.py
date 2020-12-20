@@ -677,17 +677,17 @@ class FlowTerminate(FlowModule):
 
 
 class FlowSplitTerminate(FlowSequentialModule):
-    def __init__(self, split_fraction=0.5, split_dim=1):
+    def __init__(self, split_fraction=0.5, split_dim=1, distribution: Optional[torch.distributions.Distribution] = None):
         assert 0 < split_fraction <= 1, "Invalid split fraction."
         if split_fraction == 1.0:
-            super().__init__(FlowTerminate())
+            super().__init__(FlowTerminate(distribution=distribution))
         else:
             super().__init__(
                 FlowSplit(
                     split_fractions=(1.0 - split_fraction, split_fraction),
                     split_dim=split_dim,
                 ),
-                FlowParallelStep(FlowNoopStep(), FlowTerminate()),
+                FlowParallelStep(FlowNoopStep(), FlowTerminate(distribution=distribution)),
                 FlowInverse(FlowSplit(split_fractions=(1.0, 0.0), split_dim=split_dim)),
             )
 
@@ -742,7 +742,7 @@ class FlowGlowNetwork(FlowSequentialModule):
             modules.append(
                 FlowSequentialModule(
                     *[
-                        FlowGlowStep(channels, use_affine_coupling=False)
+                        FlowGlowStep(channels, use_affine_coupling=True)
                         for _ in range(glow_step_repeat)
                     ]
                 )
