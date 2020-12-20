@@ -59,6 +59,8 @@ class MnistFlow(pl.LightningModule):
         return optimizer
 
 
+
+
 class FMnistDTS(pl.LightningDataModule):
     def __init__(self, batch_size=2048):
         super(FMnistDTS, self).__init__()
@@ -191,15 +193,30 @@ class CelebADTS(pl.LightningDataModule):
         )
 
 
+mnist_dts = MnistDTS(1)
+batch = next(iter(mnist_dts.val_dataloader()))[0]
+
+model = MnistFlow.load_from_checkpoint("/home/piter/PycharmProjects/torchflow/flow_try/77b9d8mm/checkpoints/epoch=53-step=6371.ckpt")
+print(type(batch))
+flow = model.glow_module(Flow(batch-0.5))
+print(flow)
+print(flow.logpz)
+print(flow.logdet)
+print(flow)
+print(torch.slogdet(calculate_jacobian(Flow(batch-0.5), model.glow_module)))
+exit()
+
+
+
 if __name__ == "__main__":
     torch.manual_seed(12)
     np.random.seed(12)
 
     eye = MnistFlow()
-    wandb_logger = WandbLogger(name="mnist_v11", project="flow_try")
+    wandb_logger = WandbLogger(name="mnist_v22", project="flow_try")
 
     trainer = pl.Trainer(
-        gpus=0,
+        gpus=1,
         check_val_every_n_epoch=1,
         gradient_clip_val=5,
         log_every_n_steps=1,

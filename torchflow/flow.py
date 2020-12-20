@@ -34,6 +34,9 @@ class Flow:
         )
         self.zs: [torch.Tensor] = []
 
+    def __repr__(self):
+        return "Flow high level info (means): logpz: %.3f  logdet: %.3f" % (self.logpz.mean().item(), self.logdet.mean().item())
+
     def get_logp(self):
         return self.logpz + self.logdet
 
@@ -99,6 +102,10 @@ class Flow:
 
 class FlowModule(torch.nn.Module):
     CHECK_FLOW_EXPLOSION = True
+    # If enabled, FlowSequential modules will automatically verify whether logdet returned by the FlowModule is
+    # accurate. The jacobian is calculated automatically, by treating the module as a black box.
+    # Only enable to debug logdet issues, numerically calculating logdet is extremely slow.
+    VERIFY_LOGDET_ACCURACY = False
 
     def forward(self, flow: Flow) -> Flow:
         return self.encode(flow)
@@ -125,20 +132,20 @@ class FlowModule(torch.nn.Module):
         raise NotImplementedError()
 
 
-def get_flow_flat_output(flow: Flow, batch_size: int) -> torch.Tensor:
-    components = (flow.data if isinstance(flow.data, list) else [flow.data]) + flow.zs
+def get_flow_flat_output(flow: Flow, batch_size: int, skip_num_zs=0) -> torch.Tensor:
+    components = (flow.data if isinstance(flow.data, list) else [flow.data]) + flow.zs[skip_num_zs:]
     components = [c.view(batch_size, -1) for c in components if c is not None]
     return torch.cat(components, dim=1)
 
 
 def calculate_jacobian(flow: Flow, module: FlowModule):
-    assert not flow.zs
     assert isinstance(flow.data, torch.Tensor)
     in_data: torch.Tensor = flow.data
     in_data.requires_grad = True
     batch_size = in_data.shape[0]
+    num_initial_zs = len(flow.zs)
     out_flow = module.encode(flow)
-    flat_out = get_flow_flat_output(out_flow, batch_size)
+    flat_out = get_flow_flat_output(out_flow, batch_size, skip_num_zs=num_initial_zs)
     assert flat_out.numel() == in_data.numel()
     grads = []
     for i in range(flat_out.shape[1]):
@@ -340,23 +347,26 @@ class FlowActnorm(FlowModule):
             )
 
     def _get_forward_logdet(self, x):
-        logdet = torch.sum(self.log_stds)
+        logdet = torch.sum(self._get_final_log_stds())
         for dim_size in x.shape[2:]:
             logdet *= dim_size
         return -logdet
+
+    def _get_final_log_stds(self):
+        return soft_abs_limit(self.log_stds, limit=3.0)
 
     def encode_(self, x):
         if not self._buffers["is_initialized"].item():
             self._do_init(x)
         dims = len(x.shape)
         means = adapt_for(self.means, dim=1, dims=dims)
-        log_stds = soft_abs_limit(adapt_for(self.log_stds, dim=1, dims=dims), limit=3.0)
+        log_stds = adapt_for(self._get_final_log_stds(), dim=1, dims=dims)
         return (x - means) * torch.exp(-log_stds), self._get_forward_logdet(x)
 
     def decode_(self, x):
         dims = len(x.shape)
         means = adapt_for(self.means, dim=1, dims=dims)
-        log_stds = soft_abs_limit(adapt_for(self.log_stds, dim=1, dims=dims), limit=3.0)
+        log_stds = adapt_for(self._get_final_log_stds(), dim=1, dims=dims)
         x = x * torch.exp(log_stds) + means
         return x, -self._get_forward_logdet(x)
 
@@ -511,7 +521,10 @@ class FlowSequentialModule(FlowModule):
             self.add_module(str(idx), module)
 
     def encode(self, flow: Flow):
+        in_flow = None
         for module in self._modules.values():
+            if self.VERIFY_LOGDET_ACCURACY:
+                in_flow = flow.deep_copy()
             flow = module.encode(flow)
             if self.CHECK_FLOW_EXPLOSION:
                 logdet = flow.logdet.mean().cpu().item()
@@ -520,6 +533,14 @@ class FlowSequentialModule(FlowModule):
                     raise ValueError("Logdet exploded %f, module %s" % (logdet, module))
                 if abs(logpz) > 1e10:
                     raise ValueError("Logpz exploded %f, module %s" % (logpz, module))
+            if self.VERIFY_LOGDET_ACCURACY and isinstance(in_flow.data, torch.Tensor):
+                numel = in_flow.data[0].numel()
+                actual_ele_logdet = (flow.logdet.mean().cpu().item() - in_flow.logdet.mean().cpu().item()) / numel
+                ele_logdet_est = torch.slogdet(calculate_jacobian(in_flow, module)).logabsdet.mean().cpu().item() / numel
+                is_ok = abs(ele_logdet_est - actual_ele_logdet) < 0.01
+                print("[Module %s] Logdet Actual: %.3f Expected ~%.3f Is OK?: %s" % (module.__class__.__name__, actual_ele_logdet, ele_logdet_est, is_ok))
+                if not is_ok:
+                    raise ValueError("!!! Bad logdet in module %s" % repr(module))
         return flow
 
     def decode(self, flow: Flow):
