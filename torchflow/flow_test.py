@@ -59,7 +59,7 @@ def assert_same_flow(
 
 
 def get_sample_tensor(shape=IMG_TENSOR_SHAPE):
-    return torch.empty(shape).uniform_(-0.5, 2.5)
+    return torch.empty(shape).uniform_(-5.5, 20.5)
 
 
 def get_modules():
@@ -197,7 +197,7 @@ def test_logpz_correct():
     assert_close(flow.logpz, expected_logpz, abs_tolerance=1e-2)
     data_bits = flow.get_elem_bits(sample_tensor.shape, 256)
     assert_close(
-        data_bits, torch.zeros_like(data_bits) + 8, abs_tolerance=4, rel_tolerance=2
+        data_bits, torch.zeros_like(data_bits) + 8, abs_tolerance=5, rel_tolerance=20
     )
 
 
