@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import List, TypeVar, Any
+from typing import List, TypeVar, Any, Optional, Union, List
 import copy
 
 FlowData = TypeVar("FlowData", torch.Tensor, List[torch.Tensor], Any)
@@ -27,11 +27,10 @@ class Flow:
     def get_logp(self):
         return self.logpz + self.logdet
 
-    def get_data_bits(self, input_data_shape, num_data_levels):
-        p = self.get_logp().mean()
-        num_pix = np.prod(input_data_shape[1:])
-        p_pix = p / num_pix + np.log(1. / num_data_levels)
-        return -p_pix / np.log(2.)
+    def get_elem_bits(self, input_data_shape, num_data_levels):
+        p_log2 = self.get_logp() / np.log(2.)
+        p_elem_log2 = p_log2 / np.prod(input_data_shape[1:]) - np.log2(num_data_levels)
+        return -p_elem_log2
 
     def deep_copy(self):
         flow: Flow = copy.copy(self)
@@ -52,10 +51,19 @@ class Flow:
         else:
             raise ValueError("")
 
-    def sample_like(self, std=0.2):
+    def sample_like(self, distributions_or_temperatures: Union[float, List[float], torch.distributions.Distribution, List[torch.distributions.Distribution]]=0.66):
         sample: Flow = self.deep_copy()
-        for e in sample.zs:
-            e.normal_(mean=0.0, std=std)
+        if len(sample.zs) == 0:
+            return sample
+        if isinstance(distributions_or_temperatures, float) or isinstance(distributions_or_temperatures, torch.distributions.Distribution):
+            distributions_or_temperatures = [distributions_or_temperatures]*len(self.zs)
+        if isinstance(distributions_or_temperatures[0], float):
+            distributions_or_temperatures = [torch.distributions.Normal(0.0, scale=temperature) for temperature in distributions_or_temperatures]
+        distributions: List[torch.distributions.Distribution] = distributions_or_temperatures
+        if len(distributions) != len(sample.zs):
+            raise ValueError("Invalid number of distributions provided, expected %d, got %d" % (len(sample.zs), len(distributions)))
+        for z, distribution in zip(sample.zs, distributions):
+            z.copy_(distribution.sample(z.shape))
         return sample
 
 
@@ -86,6 +94,29 @@ class FlowModule(torch.nn.Module):
     def decode_(self, x: torch.Tensor):
         raise NotImplementedError()
 
+def get_flow_flat_output(flow: Flow, batch_size: int) -> torch.Tensor:
+    components = (flow.data if isinstance(flow.data, list) else [flow.data]) + flow.zs
+    components = [c.view(batch_size, -1) for c in components if c is not None]
+    return torch.cat(components, dim=1)
+
+def calculate_jacobian(flow: Flow, module: FlowModule):
+    assert not flow.zs
+    assert isinstance(flow.data, torch.Tensor)
+    in_data: torch.Tensor = flow.data
+    in_data.requires_grad = True
+    batch_size = in_data.shape[0]
+    out_flow = module.encode(flow)
+    flat_out = get_flow_flat_output(out_flow, batch_size)
+    assert flat_out.numel() == in_data.numel()
+    grads = []
+    for i in range(flat_out.shape[1]):
+        if in_data.grad is not None:
+            in_data.grad.zero_()
+        flat_out[:, i].sum().backward(retain_graph=True)
+        assert in_data.grad is not None
+        grads.append(in_data.grad.view(batch_size, -1).detach().clone().unsqueeze(2))
+    jacobian = torch.cat(grads, dim=2)
+    return jacobian
 
 class FlowInverse(FlowModule):
     def __init__(self, flow_module: FlowModule):
@@ -151,10 +182,13 @@ class _FlowConv1x1(FlowModule):
 
 
 class FlowConv1x1(_FlowConv1x1):
-    def __init__(self, channels):
+    def __init__(self, channels, orthogonal_init=True):
         super().__init__()
         permutation = torch.Tensor(channels, channels)
-        torch.nn.init.orthogonal_(permutation, gain=1)
+        if orthogonal_init:
+            torch.nn.init.orthogonal_(permutation, gain=1)
+        else:
+            torch.nn.init.xavier_normal_(permutation, gain=1)
         self.weight = torch.nn.Parameter(permutation)
 
     def _get_2d_weight(self):
@@ -162,10 +196,13 @@ class FlowConv1x1(_FlowConv1x1):
 
 
 class FlowConv1x1Fixed(_FlowConv1x1):
-    def __init__(self, channels):
+    def __init__(self, channels, orthogonal_init=True):
         super().__init__()
         permutation = torch.Tensor(channels, channels)
-        torch.nn.init.orthogonal_(permutation, gain=1)
+        if orthogonal_init:
+            torch.nn.init.orthogonal_(permutation, gain=1)
+        else:
+            torch.nn.init.xavier_normal_(permutation, gain=1)
         self.register_buffer('fixed_permutation_logdet', torch.slogdet(permutation).logabsdet)
         self.register_buffer('fixed_permutation_inverse', torch.inverse(permutation))
         self.register_buffer('fixed_permutation', permutation)
@@ -183,11 +220,14 @@ class FlowConv1x1Fixed(_FlowConv1x1):
 class FlowConv1x1LU(_FlowConv1x1):
     """https://arxiv.org/pdf/1807.03039.pdf"""
 
-    def __init__(self, channels):
+    def __init__(self, channels, orthogonal_init=True):
         super().__init__()
         # Fixed permutation
         permutation = torch.Tensor(channels, channels)
-        torch.nn.init.orthogonal_(permutation, gain=1)
+        if orthogonal_init:
+            torch.nn.init.orthogonal_(permutation, gain=1)
+        else:
+            torch.nn.init.xavier_normal_(permutation, gain=1)
         A_LU, pivots = permutation.lu()
         P, A_L, A_U = torch.lu_unpack(A_LU, pivots)
         self.lower = torch.nn.Parameter(A_L)
@@ -209,17 +249,11 @@ class FlowConv1x1LU(_FlowConv1x1):
 
 
 def mean_for(x, dim):
-    for d in reversed(range(len(x.shape))):
-        if d != dim:
-            x = x.mean(d)
-    return x
+    return x.mean([e for e in range(len(x.shape)) if e != dim])
 
 
 def sum_for(x, dim):
-    for d in reversed(range(len(x.shape))):
-        if d != dim:
-            x = x.sum(d)
-    return x
+    return x.sum([e for e in range(len(x.shape)) if e != dim])
 
 
 def adapt_for(x, dim, dims):
@@ -525,40 +559,38 @@ class FlowNoopStep(FlowModule):
     def decode(self, flow: Flow) -> Flow:
         return flow
 
-class FlowTerminateGaussianPrior(FlowModule):
+class FlowTerminate(FlowModule):
     Log2PI = float(np.log(2 * np.pi))
 
-    def __init__(self):
+    def __init__(self, distribution: Optional[torch.distributions.Distribution]=None):
         super().__init__()
+        self.distribution: torch.distributions.Distribution = distribution if distribution is not None else torch.distributions.Normal(0.0, 1.0)
 
     def encode(self, flow: Flow) -> Flow:
         flow.zs.append(flow.data)
-        flow.logpz = flow.logpz + sum_for(self._logpz(flow.data), dim=0)
+        flow.logpz = flow.logpz + sum_for(self.distribution.log_prob(flow.data), dim=0)
         flow.data = None
         return flow
-
-    def _logpz(self, zs):
-        return -0.5 * (self.Log2PI + zs * zs)
 
     def decode(self, flow: Flow) -> Flow:
         if flow.data is not None:
             raise ValueError("")
         flow.data = flow.zs.pop()
-        flow.logpz = flow.logpz - sum_for(self._logpz(flow.data), dim=0)
+        flow.logpz = flow.logpz - sum_for(self.distribution.log_prob(flow.data), dim=0)
         return flow
 
 
 
-class FlowSplitGaussianPrior(FlowSequentialModule):
+class FlowSplitTerminate(FlowSequentialModule):
     def __init__(self, split_fraction=0.5, split_dim=1):
         assert 0 < split_fraction <= 1, "Invalid split fraction."
         if split_fraction == 1.0:
-            super().__init__(FlowTerminateGaussianPrior())
+            super().__init__(FlowTerminate())
         else:
             super().__init__(FlowSplit(split_fractions=(1.0 - split_fraction, split_fraction), split_dim=split_dim),
                    FlowParallelStep(
                        FlowNoopStep(),
-                       FlowTerminateGaussianPrior()
+                       FlowTerminate()
                    ),
                    FlowInverse(FlowSplit(split_fractions=(1.0, 0.0), split_dim=split_dim))
                 )
@@ -598,7 +630,7 @@ class FlowGlowNetwork(FlowSequentialModule):
             modules.append(FlowSqueeze2D())
             channels *= 4
             modules.append(FlowSequentialModule(*[FlowGlowStep(channels, use_affine_coupling=False) for _ in range(glow_step_repeat)]))
-            modules.append(FlowSplitGaussianPrior(split_fraction=0.5, split_dim=1))
+            modules.append(FlowSplitTerminate(split_fraction=0.5, split_dim=1))
             channels //= 2
-        modules[-1] = FlowTerminateGaussianPrior()
+        modules[-1] = FlowTerminate()
         super().__init__(*modules)

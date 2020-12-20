@@ -1,6 +1,6 @@
 import pytorch_lightning as pl
 from pl_bolts.datamodules import mnist_datamodule
-from flow import *
+from .flow import *
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import random_split
@@ -16,7 +16,7 @@ NUM_LEVELS = 64
 class MnistFlow(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        self.glow_module = FlowGlowNetwork([32, 32, 32, 32], channels=3)
+        self.glow_module = FlowGlowNetwork([32, 32, 32], channels=1)
         # self.glow_module = FlowSequentialModule(FlowSqueeze2D(), FlowGlowStep(4), FlowTerminateGaussianPrior())
 
     def forward(self, imgs) -> Flow:
@@ -27,14 +27,14 @@ class MnistFlow(pl.LightningModule):
         VAL_STEP = 0
         imgs = level_encode(batch[0], num_levels=NUM_LEVELS)
         flow = self(imgs - 0.5)
-        loss = flow.get_data_bits(input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS)
+        loss = flow.get_elem_bits(input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS).mean()
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         imgs = batch[0]
         flow = self(imgs - 0.5)
-        loss = flow.get_data_bits(input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS)
+        loss = flow.get_elem_bits(input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS).mean()
         for temperature in [0.1, 0.3, 0.4, 0.6, 0.7, 0.8]:
             self.log("samples@%f" % temperature,
                      [wandb.Image(self.glow_module.decode(flow.sample_like(temperature)).data[0].detach())],
@@ -130,9 +130,9 @@ if __name__ == '__main__':
     np.random.seed(12)
 
     eye = MnistFlow()
-    wandb_logger = WandbLogger(name="celeba64v3", project="flow_try")
+    wandb_logger = WandbLogger(name="mnist_v11", project="flow_try")
 
-    trainer = pl.Trainer(gpus=2, check_val_every_n_epoch=1, gradient_clip_val=5, log_every_n_steps=1,
+    trainer = pl.Trainer(gpus=0, check_val_every_n_epoch=1, gradient_clip_val=5, log_every_n_steps=1,
                          flush_logs_every_n_steps=50, logger=wandb_logger, num_sanity_val_steps=0)
-    dts = CelebADTS(55)
+    dts = MnistDTS(512)
     trainer.fit(eye, datamodule=dts)
