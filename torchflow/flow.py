@@ -392,6 +392,7 @@ class FlowActnorm(FlowModule):
 
     def encode_(self, x):
         if not self._buffers["is_initialized"].item():
+            print("Initializing...")
             self._do_init(x)
         dims = len(x.shape)
         means = adapt_for(self.means, dim=1, dims=dims)

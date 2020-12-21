@@ -19,23 +19,24 @@ class MnistFlow(pl.LightningModule):
         self.glow_module = FlowGlowNetwork([32, 32, 32], channels=1)
         # self.glow_module = FlowSequentialModule(FlowSqueeze2D(), FlowGlowStep(4), FlowTerminateGaussianPrior())
 
-    def forward(self, imgs) -> Flow:
-        return self.glow_module.encode(Flow(imgs))
 
     def training_step(self, batch, batch_idx):
         global VAL_STEP
         VAL_STEP = 0
         imgs = level_encode(batch[0], num_levels=NUM_LEVELS)
-        flow = self(imgs - 0.5)
+        flow = self.glow_module.encode(Flow(imgs))
         loss = flow.get_elem_bits(
             input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS
         ).mean()
+        print("Actual loss", loss.detach().clone().cpu().item())
+        print("Opts", self.trainer.optimizers[0]._optimizer)
+        self.log("step", self.global_step)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         imgs = batch[0]
-        flow = self(imgs - 0.5)
+        flow = self.glow_module.encode(Flow(imgs))
         loss = flow.get_elem_bits(
             input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS
         ).mean()
@@ -57,7 +58,6 @@ class MnistFlow(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
         return optimizer
-
 
 
 
@@ -193,36 +193,43 @@ class CelebADTS(pl.LightningDataModule):
         )
 
 
-mnist_dts = MnistDTS(1)
-batch = next(iter(mnist_dts.val_dataloader()))[0]
-
-model = MnistFlow.load_from_checkpoint("/home/piter/PycharmProjects/torchflow/flow_try/77b9d8mm/checkpoints/epoch=53-step=6371.ckpt")
-print(type(batch))
-flow = model.glow_module(Flow(batch-0.5))
-print(flow)
-print(flow.logpz)
-print(flow.logdet)
-print(flow)
-print(torch.slogdet(calculate_jacobian(Flow(batch-0.5), model.glow_module)))
-exit()
+# mnist_dts = MnistDTS(1)
+# batch = next(iter(mnist_dts.val_dataloader()))[0]
+#
+# model = MnistFlow.load_from_checkpoint("/home/piter/PycharmProjects/torchflow/flow_try/77b9d8mm/checkpoints/epoch=53-step=6371.ckpt")
+# print(type(batch))
+# flow = model.glow_module(Flow(batch-0.5))
+# print(flow)
+# print(flow.logpz)
+# print(flow.logdet)
+# print(flow)
+# print(torch.slogdet(calculate_jacobian(Flow(batch-0.5), model.glow_module)))
+# exit()
 
 
 
 if __name__ == "__main__":
-    torch.manual_seed(12)
-    np.random.seed(12)
+    torch.manual_seed(11)
+    np.random.seed(11)
 
     eye = MnistFlow()
-    wandb_logger = WandbLogger(name="mnist_v22", project="flow_try")
+    root_dir = "bolt"
+    wandb_logger = WandbLogger(name="celeba64_trash", project="flow_try", save_dir=root_dir, version="trash11")
 
+    ckpt_saver = pl.callbacks.ModelCheckpoint(dirpath=root_dir, monitor="val_loss", save_top_k=3)
     trainer = pl.Trainer(
-        gpus=1,
+        default_root_dir=root_dir,
+        gpus=2,
+        callbacks=[ckpt_saver],
         check_val_every_n_epoch=1,
         gradient_clip_val=5,
         log_every_n_steps=1,
         flush_logs_every_n_steps=50,
         logger=wandb_logger,
         num_sanity_val_steps=0,
+        resume_from_checkpoint="/home/piter/PycharmProjects/torchflow/cygan/epoch=5-step=556.ckpt",
+        enable_pl_optimizer=False,
+
     )
     dts = MnistDTS(512)
     trainer.fit(eye, datamodule=dts)
