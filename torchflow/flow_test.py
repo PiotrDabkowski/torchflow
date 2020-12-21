@@ -6,7 +6,8 @@ import math
 torch.manual_seed(11)
 
 CHANNELS = 4
-IMG_TENSOR_SHAPE = (3, CHANNELS, 12, 12)
+IMG = (3, CHANNELS, 12, 12)
+AUDIO = (7, CHANNELS, 122)
 
 
 def assert_close(
@@ -58,45 +59,84 @@ def assert_same_flow(
         cmp(actual_z, expected_z)
 
 
-def get_sample_tensor(shape=IMG_TENSOR_SHAPE):
+def get_sample_tensor(shape=IMG):
     return torch.empty(shape).uniform_(-5.5, 20.5)
 
 
 def get_modules():
     return [
-        FlowActnorm(CHANNELS),
-        FlowConv1x1(CHANNELS),
-        FlowConv1x1(CHANNELS, orthogonal_init=False),
-        FlowInverse(FlowConv1x1(CHANNELS)),
-        FlowConv1x1Fixed(CHANNELS),
-        FlowConv1x1Fixed(CHANNELS, orthogonal_init=False),
-        FlowConv1x1LU(CHANNELS),
-        FlowConv1x1LU(CHANNELS, orthogonal_init=False),
-        FlowSequentialModule(
-            FlowActnorm(channels=CHANNELS), FlowConv1x1(channels=CHANNELS)
+        (FlowActnorm(CHANNELS), IMG),
+        (FlowActnorm(CHANNELS), AUDIO),
+        (FlowConv1x1(CHANNELS), IMG),
+        (FlowConv1x1(CHANNELS), AUDIO),
+        (FlowConv1x1(CHANNELS, orthogonal_init=False), IMG),
+        (FlowConv1x1(CHANNELS, orthogonal_init=False), AUDIO),
+        (FlowInverse(FlowConv1x1(CHANNELS)), IMG),
+        (FlowInverse(FlowConv1x1(CHANNELS)), AUDIO),
+        (FlowConv1x1Fixed(CHANNELS), IMG),
+        (FlowConv1x1Fixed(CHANNELS), AUDIO),
+        (FlowConv1x1Fixed(CHANNELS, orthogonal_init=False), IMG),
+        (FlowConv1x1Fixed(CHANNELS, orthogonal_init=False), AUDIO),
+        (FlowConv1x1LU(CHANNELS), IMG),
+        (FlowConv1x1LU(CHANNELS), AUDIO),
+        (FlowConv1x1LU(CHANNELS, orthogonal_init=False), IMG),
+        (FlowConv1x1LU(CHANNELS, orthogonal_init=False), AUDIO),
+        (
+            FlowSequentialModule(
+                FlowActnorm(channels=CHANNELS), FlowConv1x1(channels=CHANNELS)
+            ),
+            IMG,
         ),
-        FlowSqueeze2D(),
-        FlowAdditiveCoupling(
-            torch.nn.Conv2d(
-                CHANNELS // 2, out_channels=CHANNELS // 2, kernel_size=3, padding=1
-            )
+        (
+            FlowSequentialModule(
+                FlowActnorm(channels=CHANNELS), FlowConv1x1(channels=CHANNELS)
+            ),
+            AUDIO,
         ),
-        FlowAffineCoupling(
-            torch.nn.Conv2d(
-                CHANNELS // 2, out_channels=CHANNELS, kernel_size=3, padding=1
-            )
+        (FlowSqueeze2D(), IMG),
+        (FlowSqueeze1D(), AUDIO),
+        (
+            FlowAdditiveCoupling(
+                torch.nn.Conv2d(
+                    CHANNELS // 2, out_channels=CHANNELS // 2, kernel_size=3, padding=1
+                )
+            ),
+            IMG,
         ),
-        FlowGlowStep(CHANNELS, use_affine_coupling=False),
-        FlowGlowStep(CHANNELS, use_affine_coupling=True),
-        FlowTerminate(),
-        FlowSplitTerminate(split_fraction=0.5),
-        FlowGlowNetwork([1, 1], channels=CHANNELS),
+        (
+            FlowAffineCoupling(
+                torch.nn.Conv2d(
+                    CHANNELS // 2, out_channels=CHANNELS, kernel_size=3, padding=1
+                )
+            ),
+            IMG,
+        ),
+        (FlowGlowStep(CHANNELS, use_affine_coupling=False), IMG),
+        (FlowGlowStep(3, use_affine_coupling=True), (5, 3, 16, 16)),
+        (FlowGlowStep(3, use_affine_coupling=False), (5, 3, 16, 16)),
+        (FlowGlowStep(CHANNELS, use_affine_coupling=True), IMG),
+        (FlowQuartzStep(CHANNELS, use_affine_coupling=False), AUDIO),
+        (FlowQuartzStep(CHANNELS, use_affine_coupling=True), AUDIO),
+        (FlowTerminate(), IMG),
+        (FlowTerminate(), AUDIO),
+        (FlowSplitTerminate(split_fraction=0.5), IMG),
+        (FlowSplitTerminate(split_fraction=0.5), AUDIO),
+    ] + get_networks() # networks are also modules.
+
+
+def get_networks():
+    return [
+        (FlowGlowNetwork([1, 1], channels=CHANNELS), IMG),
+        (FlowGlowNetwork2([1, 1, 1], channels=CHANNELS), IMG),
     ]
 
 
-@pytest.mark.parametrize("module", get_modules())
-def test_encode_deterministic(module):
-    sample_tensor = get_sample_tensor()
+@pytest.mark.parametrize("module_and_inp_shape", get_modules())
+def test_encode_deterministic(module_and_inp_shape):
+    module, inp_shape = module_and_inp_shape
+    print(module.__class__.__name__, inp_shape)
+
+    sample_tensor = get_sample_tensor(inp_shape)
     assert_same_flow(
         module.encode(Flow(sample_tensor)),
         module.encode(Flow(sample_tensor)),
@@ -106,22 +146,26 @@ def test_encode_deterministic(module):
     )
 
 
-@pytest.mark.parametrize("module", get_modules())
-def test_decode(module):
-    in_flow = Flow(get_sample_tensor())
+@pytest.mark.parametrize("module_and_inp_shape", get_modules())
+def test_decode(module_and_inp_shape):
+    module, inp_shape = module_and_inp_shape
+    print(module.__class__.__name__, inp_shape)
+    in_flow = Flow(get_sample_tensor(inp_shape))
     decoded_flow = module.decode(module.encode(in_flow.deep_copy()))
     assert_same_flow(
         in_flow,
         decoded_flow,
-        abs_tolerance=1e-4,
-        rel_tolerance=1e-4,
+        abs_tolerance=1e-3,
+        rel_tolerance=1e-3,
         reduction=torch.max,
     )
 
 
-@pytest.mark.parametrize("module", get_modules())
-def test_logdet(module):
-    sample_tensor = get_sample_tensor()
+@pytest.mark.parametrize("module_and_inp_shape", get_modules())
+def test_logdet_2d(module_and_inp_shape):
+    module, inp_shape = module_and_inp_shape
+    print(module.__class__.__name__, inp_shape)
+    sample_tensor = get_sample_tensor(inp_shape)
     flow = module.encode(Flow(sample_tensor))
 
     logdet_estimate = torch.slogdet(
@@ -157,7 +201,7 @@ def normal_prob(x):
 @pytest.mark.parametrize("split_fraction", [0.25, 0.5, 0.75, 1.0])
 def test_separation(split_fraction):
     flow_module = FlowSplitTerminate(split_fraction=split_fraction, split_dim=1)
-    sample_tensor = 1.1 * torch.randn(IMG_TENSOR_SHAPE) + 0.11
+    sample_tensor = 1.1 * torch.randn(IMG) + 0.11
     flow = flow_module.encode(Flow(sample_tensor))
     assert flow.logdet.item() == 0
     assert len(flow.zs) == 1
@@ -182,7 +226,7 @@ def test_separation(split_fraction):
 
 
 def test_logpz_correct():
-    sample_tensor = get_sample_tensor()
+    sample_tensor = get_sample_tensor(IMG)
     flow = Flow(sample_tensor)
     module = FlowGlowNetwork([1, 1], channels=CHANNELS)
     flow = module.encode(flow)
@@ -197,7 +241,7 @@ def test_logpz_correct():
     assert_close(flow.logpz, expected_logpz, abs_tolerance=1e-2)
     data_bits = flow.get_elem_bits(sample_tensor.shape, 256)
     assert_close(
-        data_bits, torch.zeros_like(data_bits) + 8, abs_tolerance=5, rel_tolerance=20
+        data_bits, torch.zeros_like(data_bits) + 11, abs_tolerance=4, rel_tolerance=20
     )
 
 

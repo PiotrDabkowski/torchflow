@@ -35,7 +35,10 @@ class Flow:
         self.zs: [torch.Tensor] = []
 
     def __repr__(self):
-        return "Flow high level info (means): logpz: %.3f  logdet: %.3f" % (self.logpz.mean().item(), self.logdet.mean().item())
+        return "Flow high level info (means): logpz: %.3f  logdet: %.3f" % (
+            self.logpz.mean().item(),
+            self.logdet.mean().item(),
+        )
 
     def get_logp(self):
         return self.logpz + self.logdet
@@ -133,7 +136,9 @@ class FlowModule(torch.nn.Module):
 
 
 def get_flow_flat_output(flow: Flow, batch_size: int, skip_num_zs=0) -> torch.Tensor:
-    components = (flow.data if isinstance(flow.data, list) else [flow.data]) + flow.zs[skip_num_zs:]
+    components = (flow.data if isinstance(flow.data, list) else [flow.data]) + flow.zs[
+        skip_num_zs:
+    ]
     components = [c.view(batch_size, -1) for c in components if c is not None]
     return torch.cat(components, dim=1)
 
@@ -185,6 +190,36 @@ class FlowSqueeze2D(FlowModule):
 
     def decode_(self, x):
         return F.pixel_shuffle(x, 2), 0.0
+
+
+class FlowSqueeze1D(FlowModule):
+    def encode_(self, x):
+        bs, c, length = x.shape
+        assert length % 2 == 0
+        out_length = length // 2
+        out_c = 2 * c
+        return (
+            x.permute(0, 2, 1)
+            .contiguous()
+            .view(bs, out_length, out_c)
+            .permute(0, 2, 1)
+            .contiguous(),
+            0.0,
+        )
+
+    def decode_(self, x):
+        bs, c, length = x.shape
+        assert c % 2 == 0
+        out_length = length * 2
+        out_c = c // 2
+        return (
+            x.permute(0, 2, 1)
+            .contiguous()
+            .view(bs, out_length, out_c)
+            .permute(0, 2, 1)
+            .contiguous(),
+            0.0,
+        )
 
 
 class _FlowConv1x1(FlowModule):
@@ -454,11 +489,11 @@ class FlowAffineCoupling(FlowModule):
         self.channel_dim = channel_dim
 
     def _get_biases_logscales(self, left, right):
-        biases_logscales = self.nonlinear_module(left)
+        biases_logscales = self.nonlinear_module(right)
         biases, logscales = torch.chunk(biases_logscales, 2, dim=self.channel_dim)
         logscales = soft_abs_limit(logscales, limit=1.1)
-        assert biases.shape == right.shape, (left.shape, biases.shape, right.shape)
-        assert logscales.shape == right.shape
+        assert biases.shape == left.shape, (left.shape, biases.shape, right.shape)
+        assert logscales.shape == left.shape
         return biases, logscales
 
     def encode_(self, x):
@@ -467,7 +502,7 @@ class FlowAffineCoupling(FlowModule):
         biases, logscales = self._get_biases_logscales(left, right)
         return (
             torch.cat(
-                [left, torch.exp(logscales) * right + biases], dim=self.channel_dim
+                [torch.exp(logscales) * left + biases, right], dim=self.channel_dim
             ),
             sum_for(logscales, dim=0),
         )
@@ -477,7 +512,7 @@ class FlowAffineCoupling(FlowModule):
         biases, logscales = self._get_biases_logscales(left, right)
         return (
             torch.cat(
-                [left, torch.exp(-logscales) * (right - biases)], dim=self.channel_dim
+                [torch.exp(-logscales) * (left - biases), right], dim=self.channel_dim
             ),
             -sum_for(logscales, dim=0),
         )
@@ -496,7 +531,7 @@ class FlowAdditiveCoupling(FlowModule):
         left, right = torch.chunk(x, 2, dim=self.channel_dim)
         return (
             torch.cat(
-                [left, right + self.nonlinear_module(left)], dim=self.channel_dim
+                [left + self.nonlinear_module(right), right] , dim=self.channel_dim
             ),
             0.0,
         )
@@ -505,7 +540,7 @@ class FlowAdditiveCoupling(FlowModule):
         left, right = torch.chunk(x, 2, dim=self.channel_dim)
         return (
             torch.cat(
-                [left, right - self.nonlinear_module(left)], dim=self.channel_dim
+                [left - self.nonlinear_module(right), right], dim=self.channel_dim
             ),
             0.0,
         )
@@ -535,10 +570,26 @@ class FlowSequentialModule(FlowModule):
                     raise ValueError("Logpz exploded %f, module %s" % (logpz, module))
             if self.VERIFY_LOGDET_ACCURACY and isinstance(in_flow.data, torch.Tensor):
                 numel = in_flow.data[0].numel()
-                actual_ele_logdet = (flow.logdet.mean().cpu().item() - in_flow.logdet.mean().cpu().item()) / numel
-                ele_logdet_est = torch.slogdet(calculate_jacobian(in_flow, module)).logabsdet.mean().cpu().item() / numel
+                actual_ele_logdet = (
+                    flow.logdet.mean().cpu().item() - in_flow.logdet.mean().cpu().item()
+                ) / numel
+                ele_logdet_est = (
+                    torch.slogdet(calculate_jacobian(in_flow, module))
+                    .logabsdet.mean()
+                    .cpu()
+                    .item()
+                    / numel
+                )
                 is_ok = abs(ele_logdet_est - actual_ele_logdet) < 0.01
-                print("[Module %s] Logdet Actual: %.3f Expected ~%.3f Is OK?: %s" % (module.__class__.__name__, actual_ele_logdet, ele_logdet_est, is_ok))
+                print(
+                    "[Module %s] Logdet Actual: %.3f Expected ~%.3f Is OK?: %s"
+                    % (
+                        module.__class__.__name__,
+                        actual_ele_logdet,
+                        ele_logdet_est,
+                        is_ok,
+                    )
+                )
                 if not is_ok:
                     raise ValueError("!!! Bad logdet in module %s" % repr(module))
         return flow
@@ -698,7 +749,12 @@ class FlowTerminate(FlowModule):
 
 
 class FlowSplitTerminate(FlowSequentialModule):
-    def __init__(self, split_fraction=0.5, split_dim=1, distribution: Optional[torch.distributions.Distribution] = None):
+    def __init__(
+        self,
+        split_fraction=0.5,
+        split_dim=1,
+        distribution: Optional[torch.distributions.Distribution] = None,
+    ):
         assert 0 < split_fraction <= 1, "Invalid split fraction."
         if split_fraction == 1.0:
             super().__init__(FlowTerminate(distribution=distribution))
@@ -708,9 +764,78 @@ class FlowSplitTerminate(FlowSequentialModule):
                     split_fractions=(1.0 - split_fraction, split_fraction),
                     split_dim=split_dim,
                 ),
-                FlowParallelStep(FlowNoopStep(), FlowTerminate(distribution=distribution)),
+                FlowParallelStep(
+                    FlowNoopStep(), FlowTerminate(distribution=distribution)
+                ),
                 FlowInverse(FlowSplit(split_fractions=(1.0, 0.0), split_dim=split_dim)),
             )
+
+
+class _CausalConv1d(torch.nn.Conv1d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+    ):
+        assert stride == 1, "Not supported."
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        self._causal_padding = (kernel_size - 1) * dilation
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        padded_input = F.pad(input, (self._causal_padding, 0), "constant", 0.0)
+        result = super().forward(padded_input)
+        assert result.shape[2] == input.shape[2], (input.shape, result.shape)
+        return result
+
+
+class FlowQuartzStep(FlowSequentialModule):
+    def __init__(self, channels, use_affine_coupling=True, kernel_size=3, dilation=1):
+        nn_channels = channels // 2
+        nn_out_channels = channels - nn_channels if not use_affine_coupling else 2*(channels - nn_channels)
+        affine_mapping_conv = torch.nn.Conv1d(
+            nn_channels,
+            out_channels=nn_out_channels,
+            kernel_size=1,
+            padding=0,
+        )
+        torch.nn.init.constant_(affine_mapping_conv.weight, 0.0)
+
+        nonlinear_module = torch.nn.Sequential(
+            _CausalConv1d(
+                nn_channels,
+                out_channels=nn_channels,
+                kernel_size=kernel_size,
+                groups=nn_channels,
+                dilation=dilation,
+            ),
+            torch.nn.Conv1d(
+                nn_channels, out_channels=nn_channels, kernel_size=1, padding=0
+            ),
+            torch.nn.BatchNorm1d(nn_channels),
+            torch.nn.ReLU(),
+            affine_mapping_conv,
+        )
+        coupling_module = (
+            FlowAffineCoupling if use_affine_coupling else FlowAdditiveCoupling
+        )
+        super().__init__(
+            FlowActnorm(channels=channels),
+            FlowConv1x1LU(channels=channels),
+            coupling_module(nonlinear_module=nonlinear_module),
+        )
 
 
 class FlowGlowStep(FlowSequentialModule):
@@ -719,12 +844,15 @@ class FlowGlowStep(FlowSequentialModule):
     """
 
     def __init__(self, channels, conv_hidden_dim=None, use_affine_coupling=True):
+        nn_channels = channels // 2
+        nn_out_channels = channels - nn_channels if not use_affine_coupling else 2*(channels - nn_channels)
         conv_hidden_dim = (
-            conv_hidden_dim if conv_hidden_dim is not None else min(channels * 12, 512)
+            conv_hidden_dim if conv_hidden_dim is not None else max(min(channels * 12, 512), nn_channels)
         )
+
         nonlinear_module = torch.nn.Sequential(
             torch.nn.Conv2d(
-                channels // 2, out_channels=conv_hidden_dim, kernel_size=3, padding=1
+                nn_channels, out_channels=conv_hidden_dim, kernel_size=3, padding=1
             ),
             torch.nn.ReLU(),
             torch.nn.Conv2d(
@@ -733,7 +861,7 @@ class FlowGlowStep(FlowSequentialModule):
             torch.nn.ReLU(),
             torch.nn.Conv2d(
                 conv_hidden_dim,
-                out_channels=channels if use_affine_coupling else channels // 2,
+                out_channels=nn_out_channels,
                 kernel_size=3,
                 padding=1,
             ),
@@ -770,5 +898,30 @@ class FlowGlowNetwork(FlowSequentialModule):
             )
             modules.append(FlowSplitTerminate(split_fraction=0.5, split_dim=1))
             channels //= 2
+        modules[-1] = FlowTerminate()
+        super().__init__(*modules)
+
+
+class FlowGlowNetwork2(FlowSequentialModule):
+    """Glow Network for NCHW images."""
+
+    def __init__(self, glow_step_repeats: [int], channels=3):
+        assert len(glow_step_repeats) > 0
+        modules = []
+        for i, glow_step_repeat in enumerate(glow_step_repeats):
+            if i != 0:
+                assert channels % 2 == 0
+                modules.append(FlowSplitTerminate(split_fraction=0.5, split_dim=1))
+                channels //= 2
+            modules.append(
+                FlowSequentialModule(
+                    *[
+                        FlowGlowStep(channels, use_affine_coupling=True)
+                        for _ in range(glow_step_repeat)
+                    ]
+                )
+            )
+            modules.append(FlowSqueeze2D())
+            channels *= 4
         modules[-1] = FlowTerminate()
         super().__init__(*modules)
