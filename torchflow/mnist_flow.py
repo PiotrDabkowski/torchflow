@@ -9,14 +9,15 @@ from torchvision.datasets import MNIST, CIFAR10, FashionMNIST, LSUN, CelebA
 import numpy as np
 import wandb
 from pytorch_lightning.loggers.wandb import WandbLogger
+import os
 
-NUM_LEVELS = 64
+NUM_LEVELS = 256
 
 
 class MnistFlow(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        self.glow_module = FlowGlowNetwork([32, 32, 32], channels=1)
+        self.glow_module = FlowGlowNetwork([32, 32, 32, 32], channels=3)
         # self.glow_module = FlowSequentialModule(FlowSqueeze2D(), FlowGlowStep(4), FlowTerminateGaussianPrior())
 
 
@@ -28,8 +29,6 @@ class MnistFlow(pl.LightningModule):
         loss = flow.get_elem_bits(
             input_data_shape=imgs.shape, num_data_levels=NUM_LEVELS
         ).mean()
-        print("Actual loss", loss.detach().clone().cpu().item())
-        print("Opts", self.trainer.optimizers[0]._optimizer)
         self.log("step", self.global_step)
         self.log("train_loss", loss)
         return loss
@@ -56,7 +55,7 @@ class MnistFlow(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-5)
         return optimizer
 
 
@@ -212,13 +211,28 @@ if __name__ == "__main__":
     torch.manual_seed(11)
     np.random.seed(11)
 
-    eye = MnistFlow()
     root_dir = "bolt"
-    wandb_logger = WandbLogger(name="celeba64_trash", project="flow_try", save_dir=root_dir, version="trash11")
+    project = "flow_try"
+    name = "celeba_pls"
+    version = "1"
+    project_dir = os.path.join(root_dir, project)
+    run_dir = os.path.join(project_dir, name, version)
+    os.makedirs(run_dir, exist_ok=True)
 
-    ckpt_saver = pl.callbacks.ModelCheckpoint(dirpath=root_dir, monitor="val_loss", save_top_k=3)
+    wandb_logger = WandbLogger(name=name, project=project, save_dir=run_dir, version=f"{name}-{version}")
+
+    ckpts_dir = os.path.join(run_dir, "ckpts")
+    ckpt_saver = pl.callbacks.ModelCheckpoint(dirpath=ckpts_dir, monitor="val_loss", save_top_k=3, mode="min", save_last=True)
+
+    last_ckpt = os.path.join(ckpts_dir, "last.ckpt")
+    if not os.path.exists(last_ckpt):
+        print("Checkoint does not exist at %s, starting from scratch", last_ckpt)
+        last_ckpt = None
+    else:
+        print("Restoring from: ", last_ckpt)
+    eye = MnistFlow()
     trainer = pl.Trainer(
-        default_root_dir=root_dir,
+        default_root_dir=run_dir,
         gpus=2,
         callbacks=[ckpt_saver],
         check_val_every_n_epoch=1,
@@ -227,9 +241,9 @@ if __name__ == "__main__":
         flush_logs_every_n_steps=50,
         logger=wandb_logger,
         num_sanity_val_steps=0,
-        resume_from_checkpoint="/home/piter/PycharmProjects/torchflow/cygan/epoch=5-step=556.ckpt",
+        resume_from_checkpoint=last_ckpt,
         enable_pl_optimizer=False,
 
     )
-    dts = MnistDTS(512)
+    dts = CelebADTS(55)
     trainer.fit(eye, datamodule=dts)

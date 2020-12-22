@@ -388,7 +388,7 @@ class FlowActnorm(FlowModule):
         return -logdet
 
     def _get_final_log_stds(self):
-        return soft_abs_limit(self.log_stds, limit=3.0)
+        return soft_abs_limit(self.log_stds, limit=2.0)
 
     def encode_(self, x):
         if not self._buffers["is_initialized"].item():
@@ -492,7 +492,7 @@ class FlowAffineCoupling(FlowModule):
     def _get_biases_logscales(self, left, right):
         biases_logscales = self.nonlinear_module(right)
         biases, logscales = torch.chunk(biases_logscales, 2, dim=self.channel_dim)
-        logscales = soft_abs_limit(logscales, limit=1.1)
+        logscales = soft_abs_limit(logscales, limit=1.0)
         assert biases.shape == left.shape, (left.shape, biases.shape, right.shape)
         assert logscales.shape == left.shape
         return biases, logscales
@@ -906,14 +906,10 @@ class FlowGlowNetwork(FlowSequentialModule):
 class FlowGlowNetwork2(FlowSequentialModule):
     """Glow Network for NCHW images."""
 
-    def __init__(self, glow_step_repeats: [int], channels=3):
-        assert len(glow_step_repeats) > 0
+    def __init__(self, glow_step_repeats: [int], channels=3, separate_after_stage1=True):
+        assert len(glow_step_repeats) > 1
         modules = []
         for i, glow_step_repeat in enumerate(glow_step_repeats):
-            if i != 0:
-                assert channels % 2 == 0
-                modules.append(FlowSplitTerminate(split_fraction=0.5, split_dim=1))
-                channels //= 2
             modules.append(
                 FlowSequentialModule(
                     *[
@@ -922,7 +918,13 @@ class FlowGlowNetwork2(FlowSequentialModule):
                     ]
                 )
             )
+            if i != 0:
+                assert channels % 2 == 0
+                modules.append(FlowSplitTerminate(split_fraction=0.5, split_dim=1))
+                channels //= 2
             modules.append(FlowSqueeze2D())
             channels *= 4
-        modules[-1] = FlowTerminate()
+        modules.pop()
+        modules.pop()
+        modules.append(FlowTerminate())
         super().__init__(*modules)
